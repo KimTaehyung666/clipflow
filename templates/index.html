@@ -20,8 +20,13 @@
   .tagline { color:var(--muted); font-size:0.8rem; margin-top:6px; letter-spacing:0.05em; text-transform:uppercase; }
 
   label { display:block; font-size:0.78rem; color:var(--muted); margin-bottom:7px; letter-spacing:0.05em; text-transform:uppercase; font-weight:500; }
-  input, select { width:100%; background:var(--surface); border:1px solid var(--border); border-radius:12px; color:var(--text); font-family:'DM Sans',sans-serif; font-size:0.93rem; padding:13px 15px; transition:border-color 0.2s,box-shadow 0.2s; outline:none; appearance:none; }
-  input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(245,158,11,0.1); }
+  input, select, textarea { width:100%; background:var(--surface); border:1px solid var(--border); border-radius:12px; color:var(--text); font-family:'DM Sans',sans-serif; font-size:0.93rem; padding:13px 15px; transition:border-color 0.2s,box-shadow 0.2s; outline:none; appearance:none; }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(245,158,11,0.1); }
+  textarea { resize:vertical; line-height:1.55; appearance:auto; }
+  .manual-box { margin:-4px 0 18px; border:1px dashed var(--border); border-radius:12px; padding:12px 16px; }
+  .manual-box summary { cursor:pointer; font-size:0.85rem; color:var(--accent); }
+  .manual-box .hint { font-size:0.8rem; color:var(--muted); line-height:1.6; margin:10px 0; }
+  .manual-box textarea { margin-top:4px; }
   select { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23555870' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 14px center; padding-right:36px; cursor:pointer; }
   select option { background:var(--surface2); }
   .form-row { margin-bottom:18px; }
@@ -93,6 +98,12 @@
     <label>Link Video YouTube</label>
     <input type="url" id="yt-url" placeholder="https://youtube.com/watch?v=... atau https://youtu.be/...">
   </div>
+
+  <details class="manual-box">
+    <summary>📄 Transcript otomatis gagal? Tempel transcript manual di sini</summary>
+    <div class="hint">YouTube sering memblokir server (Vercel) buat ambil transcript otomatis. Cara manual: buka videonya di YouTube → tombol <b>…</b> / deskripsi → <b>Buka transkrip</b> → salin semua teksnya (yang ada timestamp-nya) → tempel di bawah. Kalau kolom ini diisi, transcript ini yang dipakai.</div>
+    <textarea id="manual-transcript" rows="6" placeholder="0:00 teks transcript di sini...&#10;0:05 baris berikutnya..."></textarea>
+  </details>
 
   <div class="form-grid">
     <div>
@@ -219,7 +230,8 @@ async function analyze() {
         url,
         platform: document.getElementById('platform').value,
         contentType: document.getElementById('content-type').value,
-        maxClips: document.getElementById('max-clips').value
+        maxClips: document.getElementById('max-clips').value,
+        transcript: document.getElementById('manual-transcript').value.trim()
       })
     });
 
@@ -227,6 +239,8 @@ async function analyze() {
     if (data.error) throw new Error(data.error);
 
     currentVideoId = data.video_id;
+    const sourceLabels = {youtube: 'otomatis', manual: 'manual', transcriptapi: 'TranscriptAPI', supadata: 'Supadata'};
+    const sourceText = data.transcript_source ? ' · transcript: ' + (sourceLabels[data.transcript_source] || data.transcript_source) : '';
     const clips = Array.isArray(data.clips) ? data.clips : [];
     if (!clips.length) throw new Error('AI tidak mengembalikan clip, coba lagi ya!');
     // Simpan clips di window biar bisa diakses dari onclick
@@ -237,7 +251,7 @@ async function analyze() {
         <img class="video-thumb" src="https://img.youtube.com/vi/${data.video_id}/mqdefault.jpg" alt="thumbnail">
         <div>
           <div class="yt-badge">▶ YouTube</div>
-          <div class="video-meta">${clips.length} momen ditemukan · ${data.total_segments} segmen dianalisis</div>
+          <div class="video-meta">${clips.length} momen ditemukan · ${data.total_segments} segmen dianalisis${sourceText}</div>
         </div>
       </div>
 
@@ -285,7 +299,7 @@ async function analyze() {
       <button class="retry-btn" onclick="analyze()">↺ Analisis ulang</button>`;
 
   } catch(e) {
-    results.innerHTML = `<div class="error-box">Gagal analisis: ${e.message || 'Coba lagi ya!'}</div>`;
+    results.innerHTML = `<div class="error-box">Gagal analisis: ${escapeHtml(e.message || 'Coba lagi ya!')}</div>`;
   }
 
   btn.disabled = false;

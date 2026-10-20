@@ -9,6 +9,10 @@ load_dotenv()
 app = Flask(__name__)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Fallback transcript pihak ketiga. YouTube memblokir transcript dari IP cloud
+# (Vercel/Render/dll), jadi di deploy server, transcript diambil lewat API ini.
+TRANSCRIPT_API_KEY = os.getenv("TRANSCRIPT_API_KEY")
+SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY")
 # Model lama "llama-3.3-70b-versatile" sudah dimatikan Groq per 16 Agu 2026.
 # Pengganti resmi dari Groq: openai/gpt-oss-120b. Bisa dioverride via env GROQ_MODEL.
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -104,9 +108,188 @@ def fetch_transcript_with_timestamps(video_id):
             last_error = e
 
     if raw is None:
-        raise Exception(f"Transcript tidak tersedia. ({last_error})")
+        raise Exception(_short_transcript_error(last_error))
 
     return [_segment_to_dict(s) for s in raw]
+
+def _short_transcript_error(e):
+    """Ubah exception mentah youtube-transcript-api (yang teksnya bisa satu
+    halaman penuh) jadi pesan pendek yang enak dibaca user."""
+    if e is None:
+        return "Transcript tidak tersedia."
+    name = type(e).__name__
+    mapping = {
+        "IpBlocked": "YouTube memblokir IP server",
+        "RequestBlocked": "YouTube memblokir IP server",
+        "TranscriptsDisabled": "transcript dimatikan pemilik video",
+        "NoTranscriptFound": "video ini tidak punya transcript",
+        "NoTranscriptAvailable": "video ini tidak punya transcript",
+        "VideoUnavailable": "video tidak tersedia / private",
+        "VideoUnplayable": "video tidak bisa diputar",
+    }
+    if name in mapping:
+        return mapping[name]
+    return f"{name}: {str(e)[:120]}"
+
+def _clean_segments(raw_items, start_key="start", scale=1.0):
+    """Normalisasi daftar segmen dari API pihak ketiga ke format internal."""
+    segments = []
+    for item in raw_items or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        try:
+            start = float(item.get(start_key, 0)) / scale
+        except (TypeError, ValueError):
+            continue
+        if text:
+            segments.append({"start": start, "text": text})
+    segments.sort(key=lambda s: s["start"])
+    return segments
+
+def fetch_transcript_transcriptapi(video_id):
+    """Fallback 1: TranscriptAPI (transcriptapi.com). Balik None kalau key belum diset."""
+    if not TRANSCRIPT_API_KEY:
+        return None
+    last_error = "tidak ada respons"
+    for lang in ("id,en", "asr-id,asr-en"):
+        try:
+            r = requests.get(
+                "https://transcriptapi.com/api/v2/youtube/transcript",
+                params={"video_url": video_id, "language": lang},
+                headers={"Authorization": f"Bearer {TRANSCRIPT_API_KEY}"},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                segments = _clean_segments(r.json().get("transcript"))
+                if segments:
+                    return segments
+            last_error = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last_error = str(e)[:100]
+    raise Exception(f"TranscriptAPI gagal ({last_error})")
+
+def fetch_transcript_supadata(video_id):
+    """Fallback 2: Supadata (supadata.ai). offset/duration mereka milidetik.
+    Balik None kalau key belum diset."""
+    if not SUPADATA_API_KEY:
+        return None
+    last_error = "tidak ada respons"
+    for lang in ("id", "en"):
+        try:
+            r = requests.get(
+                "https://api.supadata.ai/v1/transcript",
+                params={
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "mode": "native",
+                    "lang": lang,
+                    "text": "false",
+                },
+                headers={"x-api-key": SUPADATA_API_KEY},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                content = r.json().get("content")
+                if isinstance(content, list):
+                    segments = _clean_segments(content, start_key="offset", scale=1000.0)
+                    if segments:
+                        return segments
+            last_error = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last_error = str(e)[:100]
+    raise Exception(f"Supadata gagal ({last_error})")
+
+_TS_PATTERN = r'(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)'
+
+def _ts_to_seconds(h, m, s):
+    return int(h or 0) * 3600 + int(m) * 60 + int(s)
+
+def parse_manual_transcript(text):
+    """Parse transcript yang ditempel user. Mendukung:
+    - WebVTT / SRT (ada panah -->)
+    - Format salinan panel transkrip YouTube: baris "0:00 teks" atau
+      timestamp dan teks bergantian baris."""
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return []
+
+    segments = []
+    if "-->" in text:
+        cue_re = re.compile(_TS_PATTERN + r'[.,]\d{1,3}\s*-->')
+        matches = list(cue_re.finditer(text))
+        for i, mt in enumerate(matches):
+            start = _ts_to_seconds(mt.group(1), mt.group(2), mt.group(3))
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            block = text[mt.end():end_pos]
+            # Sisa baris pertama setelah "-->" adalah timestamp selesai; buang.
+            if "\n" in block:
+                block = block.split("\n", 1)[1]
+            lines = []
+            for ln in block.splitlines():
+                ln = re.sub(r'<[^>]+>', '', ln).strip()
+                if ln and not ln.isdigit():
+                    lines.append(ln)
+            if lines:
+                segments.append({"start": start, "text": " ".join(lines)})
+        segments.sort(key=lambda s: s["start"])
+        return segments
+
+    line_re = re.compile(r'^[\[]?' + _TS_PATTERN + r'[\]]?\s*(.*)$')
+    pending = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = line_re.match(line)
+        if m:
+            start = _ts_to_seconds(m.group(1), m.group(2), m.group(3))
+            rest = m.group(4).strip()
+            if rest:
+                segments.append({"start": start, "text": rest})
+                pending = None
+            else:
+                pending = start
+        elif pending is not None:
+            segments.append({"start": pending, "text": line})
+            pending = None
+        elif segments:
+            segments[-1]["text"] += " " + line
+    segments.sort(key=lambda s: s["start"])
+    return segments
+
+def get_transcript_segments(video_id, manual_text=""):
+    """Sumber transcript berurutan: tempelan manual user -> library langsung
+    (gratis, jalan dari IP rumahan) -> TranscriptAPI -> Supadata.
+    Balik (segments, sumber)."""
+    if manual_text:
+        segments = parse_manual_transcript(manual_text)
+        if len(segments) >= 5:
+            return segments, "manual"
+
+    try:
+        return fetch_transcript_with_timestamps(video_id), "youtube"
+    except Exception as e:
+        direct_error = str(e)
+
+    def _brief(msg):
+        return " ".join(str(msg).split())[:120]
+
+    errors = [_brief(direct_error)]
+    for fn in (fetch_transcript_transcriptapi, fetch_transcript_supadata):
+        try:
+            segments = fn(video_id)
+            if segments:
+                return segments, fn.__name__.replace("fetch_transcript_", "")
+        except Exception as e:
+            errors.append(_brief(e))
+
+    detail = "; ".join(errors)[:300]
+    raise Exception(
+        "Gagal ambil transcript otomatis. YouTube memblokir IP server (Vercel), "
+        "dan API fallback belum aktif/gagal. Solusi: tempel transcript manual "
+        "(kolom di bawah link video), atau isi TRANSCRIPT_API_KEY / SUPADATA_API_KEY "
+        f"di Environment Variables. Detail: {detail}"
+    )
 
 def format_time(seconds):
     seconds = int(seconds)
@@ -228,8 +411,10 @@ def analyze():
     if not video_id:
         return jsonify({"error": "URL bukan video YouTube yang valid!"}), 400
 
+    manual_text = str(data.get("transcript", ""))[:200_000]
+
     try:
-        segments = fetch_transcript_with_timestamps(video_id)
+        segments, transcript_source = get_transcript_segments(video_id, manual_text)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -277,7 +462,7 @@ Balas HANYA dengan JSON object persis seperti ini, tanpa teks lain:
         clips = parse_clips(raw)
         if not clips:
             return jsonify({"error": "Format response tidak valid, coba lagi!"}), 500
-        return jsonify({"clips": clips, "video_id": video_id, "total_segments": len(segments)})
+        return jsonify({"clips": clips, "video_id": video_id, "total_segments": len(segments), "transcript_source": transcript_source})
     except requests.Timeout:
         return jsonify({"error": "Timeout, coba lagi!"}), 504
     except Exception as e:
