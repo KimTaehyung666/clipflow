@@ -10,6 +10,10 @@ cp .env.example .env   # lalu isi GROQ_API_KEY kamu
 python app.py          # buka http://localhost:5002
 ```
 
+## Jalanin di HP sendiri (Termux) — transcript full otomatis
+
+YouTube memblokir transcript dari IP cloud, tapi tidak dari IP HP/rumahan. Kalau app ini dijalankan di HP Android pakai Termux, analisisnya full otomatis lagi tanpa API transcript berbayar. Panduan lengkap: [PANDUAN-TERMUX.md](PANDUAN-TERMUX.md).
+
 ## Deploy ke Render (gratis, tanpa kartu)
 
 1. Di Render: **New → Blueprint**, pilih repo ini (ada `render.yaml`).
