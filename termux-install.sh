@@ -10,7 +10,7 @@ echo ""
 # clang & make disiapkan sekalian: sebagian paket Python (mis. MarkupSafe)
 # perlu dicompile di HP, dan di Android 32-bit wheel siap pakai sering tidak ada.
 pkg update -y
-pkg install -y python git clang make pkg-config
+pkg install -y python git clang make pkg-config ffmpeg
 
 if [ -d "$HOME/clipflow" ]; then
   echo ""

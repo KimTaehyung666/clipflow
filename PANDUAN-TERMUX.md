@@ -37,5 +37,5 @@ Berhenti: di Termux tekan tombol **CTRL** (di baris tombol tambahan Termux) lalu
 
 - Jangan bersihkan Termux dari recent apps selama app dipakai, biar tidak dimatikan Android.
 - Kalau analisis pertama agak lambat, itu normal (Groq + ambil transcript butuh beberapa detik).
-- Update app ke versi terbaru: `cd ~/clipflow && git pull`, lalu jalanin lagi.
+- Update app ke versi terbaru: jalanin lagi perintah install di langkah 2 (dia otomatis `git pull` + install ulang dependensi, termasuk ffmpeg & yt-dlp buat fitur potong video).
 - Kalau ada error merah pas install, screenshot aja errornya — biasanya urusan paket yang gagal compile, ada jalan keluarnya.

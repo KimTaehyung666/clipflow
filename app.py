@@ -1,5 +1,6 @@
-import os, json, re
-from flask import Flask, render_template, request, jsonify
+import os, json, re, shutil, sqlite3, subprocess, sys, threading, time, uuid
+from datetime import datetime, timezone
+from flask import Flask, render_template, request, jsonify, send_file, abort
 from dotenv import load_dotenv
 import requests
 from urllib.parse import urlparse, parse_qs
@@ -9,14 +10,56 @@ load_dotenv()
 app = Flask(__name__)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Fallback transcript pihak ketiga. YouTube memblokir transcript dari IP cloud
-# (Vercel/Render/dll), jadi di deploy server, transcript diambil lewat API ini.
-TRANSCRIPT_API_KEY = os.getenv("TRANSCRIPT_API_KEY")
-SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY")
 # Model lama "llama-3.3-70b-versatile" sudah dimatikan Groq per 16 Agu 2026.
 # Pengganti resmi dari Groq: openai/gpt-oss-120b. Bisa dioverride via env GROQ_MODEL.
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Fallback transcript pihak ketiga. YouTube memblokir transcript dari IP cloud
+# (Vercel/Render/dll), jadi di deploy server, transcript diambil lewat API ini.
+TRANSCRIPT_API_KEY = os.getenv("TRANSCRIPT_API_KEY")
+SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY")
+
+# Penyimpanan lokal (riwayat, cache video, hasil potongan).
+# Di Vercel filesystem cuma /tmp yang bisa ditulis.
+if os.getenv("CLIPRADAR_DATA"):
+    DATA_DIR = os.environ["CLIPRADAR_DATA"]
+elif os.getenv("VERCEL"):
+    DATA_DIR = "/tmp/clipradar"
+else:
+    DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+CLIPS_DIR = os.path.join(DATA_DIR, "clips")
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+SRT_DIR = os.path.join(DATA_DIR, "srt")
+DB_PATH = os.path.join(DATA_DIR, "clipradar.db")
+for _d in (DATA_DIR, CLIPS_DIR, CACHE_DIR, SRT_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except OSError:
+        pass
+
+def find_ffmpeg():
+    env = os.getenv("FFMPEG_BIN")
+    if env and os.path.exists(env):
+        return env
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def find_ytdlp_cmd():
+    found = shutil.which("yt-dlp")
+    if found:
+        return [found]
+    try:
+        import yt_dlp  # noqa: F401
+        return [sys.executable, "-m", "yt_dlp"]
+    except Exception:
+        return None
 
 def call_groq(prompt, max_tokens=2500):
     if not GROQ_API_KEY:
@@ -204,6 +247,18 @@ _TS_PATTERN = r'(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)'
 def _ts_to_seconds(h, m, s):
     return int(h or 0) * 3600 + int(m) * 60 + int(s)
 
+def parse_ts(ts):
+    """Parse 'M:SS' / 'H:MM:SS' / detik polos jadi float detik. None kalau invalid."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    m = re.match(r'^\s*(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)\s*$', str(ts or ""))
+    if m:
+        return float(_ts_to_seconds(m.group(1), m.group(2), m.group(3)))
+    try:
+        return float(str(ts).strip())
+    except (TypeError, ValueError):
+        return None
+
 def parse_manual_transcript(text):
     """Parse transcript yang ditempel user. Mendukung:
     - WebVTT / SRT (ada panah -->)
@@ -389,9 +444,234 @@ Contoh: "gue ga nyangka hasilnya bakal separah ini pas ditest", "ini alasan kena
 Contoh: "ini momen yang bikin semua orang langsung diem", "ga ada yang nyangka ini bakal kejadian hari ini" """
 }
 
+# ---------- Database (riwayat & jobs) ----------
+
+_db_lock = threading.Lock()
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init():
+    with _db_lock, db_conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            video_id TEXT, url TEXT, platform TEXT, content_type TEXT,
+            source TEXT, clips TEXT, segments TEXT, created_at TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            video_id TEXT, status TEXT, message TEXT,
+            file TEXT, error TEXT, created_at TEXT)""")
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def save_history(video_id, url, platform, content_type, source, clips, segments):
+    with _db_lock, db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO history (video_id, url, platform, content_type, source, clips, segments, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (video_id, url, platform, content_type, source,
+             json.dumps(clips), json.dumps(segments[:3000]), _now_iso()))
+        return cur.lastrowid
+
+def list_history():
+    with _db_lock, db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, video_id, url, platform, content_type, source, clips, created_at FROM history ORDER BY id DESC LIMIT 50").fetchall()
+    out = []
+    for r in rows:
+        try:
+            n_clips = len(json.loads(r["clips"] or "[]"))
+        except ValueError:
+            n_clips = 0
+        out.append({"id": r["id"], "video_id": r["video_id"], "url": r["url"],
+                    "platform": r["platform"], "content_type": r["content_type"],
+                    "source": r["source"], "n_clips": n_clips, "created_at": r["created_at"]})
+    return out
+
+def get_history(hid):
+    with _db_lock, db_conn() as conn:
+        r = conn.execute("SELECT * FROM history WHERE id = ?", (hid,)).fetchone()
+    if not r:
+        return None
+    return {"id": r["id"], "video_id": r["video_id"], "url": r["url"],
+            "platform": r["platform"], "content_type": r["content_type"],
+            "source": r["source"],
+            "clips": json.loads(r["clips"] or "[]"),
+            "segments": json.loads(r["segments"] or "[]"),
+            "created_at": r["created_at"]}
+
+def delete_history(hid):
+    with _db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM history WHERE id = ?", (hid,))
+
+def create_job(job_id, video_id):
+    with _db_lock, db_conn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (id, video_id, status, message, file, error, created_at) VALUES (?,?,?,?,?,?,?)",
+            (job_id, video_id, "queued", "Antrian…", "", "", _now_iso()))
+
+def update_job(job_id, status=None, message=None, file=None, error=None):
+    fields, values = [], []
+    for col, val in (("status", status), ("message", message), ("file", file), ("error", error)):
+        if val is not None:
+            fields.append(f"{col} = ?")
+            values.append(val)
+    if not fields:
+        return
+    values.append(job_id)
+    with _db_lock, db_conn() as conn:
+        conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", values)
+
+def get_job(job_id):
+    with _db_lock, db_conn() as conn:
+        r = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not r:
+        return None
+    return {"id": r["id"], "video_id": r["video_id"], "status": r["status"],
+            "message": r["message"], "file": r["file"], "error": r["error"],
+            "created_at": r["created_at"]}
+
+def list_done_jobs():
+    with _db_lock, db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = 'done' ORDER BY created_at DESC LIMIT 50").fetchall()
+    out = []
+    for r in rows:
+        path = os.path.join(CLIPS_DIR, r["file"] or "")
+        if r["file"] and os.path.exists(path):
+            out.append({"id": r["id"], "video_id": r["video_id"], "file": r["file"],
+                        "size": os.path.getsize(path), "created_at": r["created_at"]})
+    return out
+
+try:
+    db_init()
+except Exception:
+    pass
+
+# ---------- Potong video (yt-dlp + ffmpeg) ----------
+
+def _srt_ts(sec):
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def build_srt(segments, start, end):
+    """Bikin SRT khusus rentang [start, end], timestamp digeser mulai dari 0."""
+    cues = []
+    segs = [s for s in segments if start - 1 <= float(s.get("start", 0)) < end]
+    for i, s in enumerate(segs):
+        s_start = float(s.get("start", 0))
+        s_end = float(segs[i + 1].get("start", s_start + 4)) if i + 1 < len(segs) else s_start + 4
+        cue_start = max(s_start, start) - start
+        cue_end = min(s_end, end) - start
+        text = " ".join(str(s.get("text", "")).split())
+        if text and cue_end > cue_start:
+            cues.append(f"{len(cues) + 1}\n{_srt_ts(cue_start)} --> {_srt_ts(cue_end)}\n{text}")
+    return "\n\n".join(cues) + ("\n" if cues else "")
+
+def ensure_source_video(video_id):
+    cache = os.path.join(CACHE_DIR, f"{video_id}.mp4")
+    if os.path.exists(cache) and os.path.getsize(cache) > 10_000:
+        return cache
+    cmd = find_ytdlp_cmd()
+    if not cmd:
+        raise Exception("yt-dlp belum terinstall. Di Termux: pip install yt-dlp (sudah termasuk requirements).")
+    full = cmd + [
+        "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+        "--merge-output-format", "mp4",
+        "--no-playlist", "--no-warnings",
+        "-o", cache,
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    proc = subprocess.run(full, capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0 or not os.path.exists(cache):
+        tail = " ".join((proc.stderr or "").split())[-220:]
+        raise Exception(f"Gagal download video sumber: {tail}")
+    return cache
+
+def _escape_filter_path(path):
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+def run_cut_job(job_id, video_id, start, end, vertical, captions, segments):
+    ffmpeg = find_ffmpeg()
+    try:
+        if not ffmpeg:
+            raise Exception("ffmpeg tidak ditemukan. Di Termux: pkg install ffmpeg lalu jalanin lagi installer-nya.")
+        update_job(job_id, status="working", message="Ngambil video sumber… (download pertama agak lama, berikutnya cached)")
+        src = ensure_source_video(video_id)
+
+        tag = "vertikal" if vertical else "biasa"
+        out_name = f"{video_id}_{int(start)}-{int(end)}_{tag}_{job_id[:6]}.mp4"
+        out_path = os.path.join(CLIPS_DIR, out_name)
+        tmp_path = out_path + ".tmp.mp4"
+
+        vf_parts = []
+        if vertical:
+            vf_parts.append(
+                "split=2[a][b];"
+                "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
+                "[b]scale=1080:-2[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+            )
+        update_job(job_id, message="Lagi motong video…")
+        cmd = [ffmpeg, "-y", "-ss", f"{start}", "-to", f"{end}", "-i", src,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+        if vf_parts:
+            cmd += ["-vf", ",".join(vf_parts)]
+        cmd += [tmp_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        if proc.returncode != 0 or not os.path.exists(tmp_path):
+            tail = " ".join((proc.stderr or "").split())[-220:]
+            raise Exception(f"ffmpeg gagal motong: {tail}")
+        os.replace(tmp_path, out_path)
+
+        note = ""
+        if captions and segments:
+            srt_text = build_srt(segments, start, end)
+            if srt_text.strip():
+                update_job(job_id, message="Nempel caption…")
+                srt_path = os.path.join(SRT_DIR, f"{job_id}.srt")
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(srt_text)
+                cap_path = out_path + ".cap.mp4"
+                cap_cmd = [ffmpeg, "-y", "-i", out_path,
+                           "-vf", f"subtitles='{_escape_filter_path(srt_path)}'",
+                           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                           "-c:a", "copy", cap_path]
+                proc2 = subprocess.run(cap_cmd, capture_output=True, text=True, timeout=1200)
+                if proc2.returncode == 0 and os.path.exists(cap_path):
+                    os.replace(cap_path, out_path)
+                else:
+                    note = " (caption gagal nempel, video tetap jadi)"
+                    if os.path.exists(cap_path):
+                        os.remove(cap_path)
+        update_job(job_id, status="done", message=f"Selesai!{note}", file=out_name)
+    except Exception as e:
+        update_job(job_id, status="error", message="", error=str(e)[:400])
+
+# ---------- Routes ----------
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/api/capabilities")
+def capabilities():
+    ffmpeg = find_ffmpeg()
+    ytdlp = find_ytdlp_cmd()
+    return jsonify({
+        "ffmpeg": bool(ffmpeg),
+        "ytdlp": bool(ytdlp),
+        "cutting": bool(ffmpeg and ytdlp),
+        "transcript_api": bool(TRANSCRIPT_API_KEY or SUPADATA_API_KEY),
+        "serverless": bool(os.getenv("VERCEL")),
+    })
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -404,6 +684,11 @@ def analyze():
     except (ValueError, TypeError):
         max_clips = 5
     max_clips = max(1, min(10, max_clips))
+    try:
+        target_duration = int(data.get("targetDuration", 60))
+    except (ValueError, TypeError):
+        target_duration = 60
+    target_duration = max(15, min(180, target_duration))
 
     if not url:
         return jsonify({"error": "URL tidak boleh kosong!"}), 400
@@ -438,6 +723,7 @@ def analyze():
 
 Platform target: {platform}
 Jenis konten: {content_type}
+Target durasi tiap clip: sekitar {target_duration} detik (end = start + kurang lebih {target_duration} detik; boleh meleset dikit demi momen yang utuh).
 
 Transcript video dengan timestamp:
 ---
@@ -462,11 +748,112 @@ Balas HANYA dengan JSON object persis seperti ini, tanpa teks lain:
         clips = parse_clips(raw)
         if not clips:
             return jsonify({"error": "Format response tidak valid, coba lagi!"}), 500
-        return jsonify({"clips": clips, "video_id": video_id, "total_segments": len(segments), "transcript_source": transcript_source})
+        history_id = None
+        try:
+            history_id = save_history(video_id, url, platform, content_type, transcript_source, clips, segments)
+        except Exception:
+            pass
+        clean_segments = [{"start": float(s.get("start", 0)), "text": str(s.get("text", ""))} for s in segments[:3000]]
+        return jsonify({"clips": clips, "video_id": video_id, "total_segments": len(segments),
+                        "transcript_source": transcript_source, "segments": clean_segments,
+                        "history_id": history_id})
     except requests.Timeout:
         return jsonify({"error": "Timeout, coba lagi!"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/clips", methods=["POST"])
+def create_clip():
+    if not find_ffmpeg() or not find_ytdlp_cmd():
+        return jsonify({"error": "Fitur potong video butuh ffmpeg + yt-dlp di server. Di Vercel (serverless) fitur ini mati — jalanin app-nya di Termux ya."}), 400
+    data = request.get_json(silent=True) or {}
+    video_id = str(data.get("video_id", "")).strip()
+    if not re.match(r'^[A-Za-z0-9_-]{6,20}$', video_id):
+        return jsonify({"error": "video_id tidak valid."}), 400
+    start = parse_ts(data.get("start"))
+    end = parse_ts(data.get("end"))
+    if start is None or end is None or end <= start:
+        return jsonify({"error": "Timestamp start/end tidak valid."}), 400
+    if end - start > 600:
+        return jsonify({"error": "Durasi clip maksimal 10 menit."}), 400
+    segments = data.get("segments") or []
+    if not isinstance(segments, list):
+        segments = []
+    segments = segments[:3000]
+    job_id = uuid.uuid4().hex[:12]
+    try:
+        create_job(job_id, video_id)
+    except Exception as e:
+        return jsonify({"error": f"Gagal bikin job: {e}"}), 500
+    t = threading.Thread(
+        target=run_cut_job,
+        args=(job_id, video_id, float(start), float(end),
+              bool(data.get("vertical")), bool(data.get("captions")), segments),
+        daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id, "status": "queued"})
+
+@app.route("/api/jobs/<job_id>")
+def job_status(job_id):
+    job = get_job(job_id)
+    if not job:
+        abort(404)
+    if job["status"] == "done" and job["file"]:
+        job["download_url"] = f"/download/{job_id}"
+    return jsonify(job)
+
+@app.route("/api/clips", methods=["GET"])
+def clips_list():
+    return jsonify({"clips": list_done_jobs()})
+
+@app.route("/download/<job_id>")
+def download_clip(job_id):
+    job = get_job(job_id)
+    if not job or job["status"] != "done" or not job["file"]:
+        abort(404)
+    path = os.path.join(CLIPS_DIR, os.path.basename(job["file"]))
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=job["file"])
+
+@app.route("/api/history", methods=["GET"])
+def history_list():
+    return jsonify({"history": list_history()})
+
+@app.route("/api/history/<int:hid>", methods=["GET"])
+def history_get(hid):
+    h = get_history(hid)
+    if not h:
+        abort(404)
+    return jsonify(h)
+
+@app.route("/api/history/<int:hid>", methods=["DELETE"])
+def history_delete(hid):
+    delete_history(hid)
+    return jsonify({"ok": True})
+
+@app.route("/api/history/<int:hid>/export")
+def history_export(hid):
+    h = get_history(hid)
+    if not h:
+        abort(404)
+    lines = [f"ClipRadar — hasil analisis",
+             f"Video: https://www.youtube.com/watch?v={h['video_id']}",
+             f"Platform: {h['platform']} | Jenis: {h['content_type']} | Sumber transcript: {h['source']}",
+             f"Tanggal: {h['created_at']}", ""]
+    for i, c in enumerate(h["clips"], 1):
+        lines.append(f"{i}. [{c['start']} -> {c['end']}] (skor {c['score']}/10)")
+        lines.append(f"   Hook: {c['hook']}")
+        if c.get("hashtags"):
+            lines.append(f"   Hashtag: {c['hashtags']}")
+        if c.get("reason"):
+            lines.append(f"   Alasan: {c['reason']}")
+        lines.append("")
+    from io import BytesIO
+    return send_file(BytesIO("\n".join(lines).encode("utf-8")),
+                     as_attachment=True,
+                     download_name=f"clipradar-{h['video_id']}.txt",
+                     mimetype="text/plain")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5002)), debug=os.environ.get("DEBUG") == "1")
